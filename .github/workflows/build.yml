@@ -1,0 +1,64 @@
+name: Build Falco offline assets
+on:
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: 'Pin official Falco Helm chart version'
+        required: true
+        default: '6.0.2'
+permissions:
+  contents: read
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+      - name: Prepare charts and image list
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/{charts,images,drivers,values,manifests}
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo update
+          helm pull falcosecurity/falco --version '${{ inputs.chart_version }}' --destination out/charts
+          CHART="$(find out/charts -name '*.tgz' -print -quit)"
+          helm show chart "$CHART" > out/chart-info.yaml
+          APP_VERSION="$(helm show chart "$CHART" | awk '/^appVersion:/{gsub(/"/,"",$2);print $2}')"
+          test -n "$APP_VERSION"
+          echo "$APP_VERSION" > out/falco-version.txt
+          cat > out/values/offline-values.yaml <<'YAML'
+          driver:
+            enabled: true
+            kind: kmod
+            loader:
+              enabled: true
+          falcoctl:
+            artifact:
+              install:
+                enabled: false
+              follow:
+                enabled: false
+          YAML
+          helm template falco "$CHART" -n falco -f out/values/offline-values.yaml > out/manifests/preview.yaml
+          python3 -m pip install --break-system-packages pyyaml
+          python3 scripts/images_from_manifest.py out/manifests/preview.yaml > out/images/list.txt
+          cat out/images/list.txt
+          while IFS= read -r img; do docker pull --platform linux/amd64 "$img"; done < out/images/list.txt
+          # Save with original references. Retag and push to internal registry on the connected internal machine.
+          mapfile -t images < out/images/list.txt
+          docker save "${images[@]}" -o out/images/falco-images.tar
+          # Source is for a future isolated build. This workflow does NOT claim to produce falco.ko.
+          curl --fail --location --retry 3 "https://github.com/falcosecurity/falco/archive/refs/tags/${APP_VERSION}.tar.gz" -o out/drivers/falco-source.tar.gz || \
+          curl --fail --location --retry 3 "https://github.com/falcosecurity/falco/archive/refs/tags/v${APP_VERSION}.tar.gz" -o out/drivers/falco-source.tar.gz
+          sha256sum out/images/falco-images.tar out/charts/*.tgz out/drivers/falco-source.tar.gz > out/SHA256SUMS
+          cp README.md out/README.md
+          tar -C out -czf falco-offline-assets.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: falco-offline-assets
+          path: falco-offline-assets.tar.gz
+          retention-days: 7
